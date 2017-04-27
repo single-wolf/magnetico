@@ -218,7 +218,7 @@ def initialize_magneticod_db() -> None:
         magneticod_db.execute("PRAGMA journal_mode=WAL;")
         magneticod_db.execute("PRAGMA temp_store=2;")
 
-        magneticod_db.execute("CREATE VIRTUAL TABLE temp.fts_torrents USING fts4(name);")
+        magneticod_db.execute("CREATE VIRTUAL TABLE temp.fts_torrents USING fts4(name ,tokenize=unicode61;)")
         magneticod_db.execute("INSERT INTO fts_torrents (docid, name) SELECT id, name FROM torrents;")
         magneticod_db.execute("INSERT INTO fts_torrents (fts_torrents) VALUES ('optimize');")
 
