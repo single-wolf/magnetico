@@ -15,10 +15,9 @@
 import collections
 import functools
 from datetime import datetime
-import logging
 import sqlite3
 import os
-
+import pymysql
 import appdirs
 import flask
 
@@ -31,10 +30,6 @@ Torrent = collections.namedtuple("torrent", ["info_hash", "name", "size", "disco
 
 app = flask.Flask(__name__)
 app.config.from_object(__name__)
-
-# TODO: We should have been able to use flask.g but it does NOT persist across different requests so we resort back to
-# this. Investigate the cause and fix it (I suspect of Gevent).
-magneticod_db = None
 
 
 # Adapted from: http://flask.pocoo.org/snippets/8/
@@ -72,11 +67,7 @@ def requires_auth(f):
 @app.route("/")
 @requires_auth
 def home_page():
-    with magneticod_db:
-        cur = magneticod_db.execute("SELECT MAX(ROWID) FROM torrents ;")
-        n_torrents = cur.fetchone()[0]
-
-    return flask.render_template("homepage.html", n_torrents=n_torrents)
+    return flask.render_template("homepage.html")
 
 
 @app.route("/torrents/")
@@ -91,6 +82,8 @@ def torrents():
 
 
 def search_torrents():
+    magneticod_db = get_magneticod_db()
+
     search = flask.request.args["search"]
     page = int(flask.request.args.get("page", 0))
 
@@ -98,25 +91,30 @@ def search_torrents():
         "search": search,
         "page": page
     }
-
-    with magneticod_db:
-        cur = magneticod_db.execute(
-            "SELECT"
-            "    info_hash, "
-            "    name, "
-            "    total_size, "
-            "    discovered_on "
-            "FROM torrents "
-            "INNER JOIN ("
-            "    SELECT docid AS id, rank(matchinfo(fts_torrents, 'pcnxal')) AS rank "
-            "    FROM fts_torrents "
-            "    WHERE name MATCH ? "
-            "    ORDER BY rank ASC"
-            "    LIMIT 20 OFFSET ?"
-            ") AS ranktable USING(id);",
-            (search, 20 * page)
-        )
-        context["torrents"] = [Torrent(t[0].hex(), t[1], utils.to_human_size(t[2]),
+    searchkey = '%'+search+'%'
+    total_page = 20*page
+    with magneticod_db.cursor() as cur:
+        sql="SELECT info_hash,name,total_size,discovered_on FROM torrents where name like '%s' ORDER BY id DESC LIMIT 20 OFFSET %d;" % (searchkey,total_page)
+        #cur.execute(
+        #    "SELECT"
+        #    "    info_hash, "
+        #    "    name, "
+        #    "    total_size, "
+        #    "    discovered_on "
+        #    "FROM torrents where name like '%s'"
+        #    "ORDER BY discovered_on DESC LIMIT 20 OFFSET '%d';" % \
+        #    #"INNER JOIN ("
+        #    #"    SELECT torrent_id, rank(matchinfo(fts_torrents, 'pcnxal')) AS rank "
+        #    #"    FROM fts_torrents "
+        #    #"    WHERE name MATCH ? "
+        #    #"    ORDER BY rank ASC"
+        #    #"    LIMIT 20 OFFSET ?"
+        #    #") AS ranktable ON torrents.id=ranktable.torrent_id;",
+	#    (searchkey, total_page)
+        #)
+        print(sql)
+        cur.execute(sql)
+        context["torrents"] = [Torrent(t[0], t[1], utils.to_human_size(t[2]),
                                        datetime.fromtimestamp(t[3]).strftime("%d/%m/%Y"), [])
                                for t in cur.fetchall()]
 
@@ -129,24 +127,26 @@ def search_torrents():
 
 
 def newest_torrents():
+    magneticod_db = get_magneticod_db()
+
     page = int(flask.request.args.get("page", 0))
 
     context = {
         "page": page
     }
-
-    with magneticod_db:
-        cur = magneticod_db.execute(
+    total_page=20*page
+    with magneticod_db.cursor() as cur:
+        cur.execute(
             "SELECT "
             "  info_hash, "
             "  name, "
             "  total_size, "
             "  discovered_on "
             "FROM torrents "
-            "ORDER BY id DESC LIMIT 20 OFFSET ?",
-            (20 * page,)
+            "ORDER BY discovered_on DESC LIMIT 20 OFFSET %d" %
+            (total_page,)
         )
-        context["torrents"] = [Torrent(t[0].hex(), t[1], utils.to_human_size(t[2]), datetime.fromtimestamp(t[3]).strftime("%d/%m/%Y"), [])
+        context["torrents"] = [Torrent(t[0], t[1], utils.to_human_size(t[2]), datetime.fromtimestamp(t[3]).strftime("%d/%m/%Y"), [])
                                for t in cur.fetchall()]
 
     # noinspection PyTypeChecker
@@ -161,14 +161,16 @@ def newest_torrents():
 @app.route("/torrents/<info_hash>/", defaults={"name": None})
 @requires_auth
 def torrent_redirect(**kwargs):
-    try:
-        info_hash = bytes.fromhex(kwargs["info_hash"])
-        assert len(info_hash) == 20
-    except (AssertionError, ValueError):  # In case info_hash variable is not a proper hex-encoded bytes
-        return flask.abort(400)
+    magnetico_db = get_magneticod_db()
 
-    with magnetico_db:
-        cur = magnetico_db.execute("SELECT name FROM torrents WHERE info_hash=? LIMIT 1;", (info_hash,))
+    #try:
+        #info_hash = bytes.fromhex(kwargs["info_hash"])
+    info_hash = kwargs["info_hash"]
+       #assert len(info_hash) == 20
+    #except (AssertionError, ValueError):  # In case info_hash variable is not a proper hex-encoded bytes
+        #return flask.abort(400)
+    with magneticod_db.cursor() as cur:
+        cur.execute("SELECT name FROM torrents WHERE info_hash='%s' LIMIT 1;" %  (info_hash,))
         try:
             name = cur.fetchone()[0]
         except TypeError:  # In case no results returned, TypeError will be raised when we try to subscript None object
@@ -180,56 +182,58 @@ def torrent_redirect(**kwargs):
 @app.route("/torrents/<info_hash>/<name>")
 @requires_auth
 def torrent(**kwargs):
+    magneticod_db = get_magneticod_db()
     context = {}
 
-    try:
-        info_hash = bytes.fromhex(kwargs["info_hash"])
-        assert len(info_hash) == 20
-    except (AssertionError, ValueError):  # In case info_hash variable is not a proper hex-encoded bytes
-        return flask.abort(400)
+    #try:
+    info_hash = kwargs["info_hash"]
+        #assert len(info_hash) == 20
+    #except (AssertionError, ValueError):  # In case info_hash variable is not a proper hex-encoded bytes
+        #return flask.abort(400)
 
-    with magneticod_db:
-        cur = magneticod_db.execute("SELECT id, name, discovered_on FROM torrents WHERE info_hash=? LIMIT 1;",
-                                    (info_hash,))
+    with magneticod_db.cursor() as cur:
+        cur.execute("SELECT name, discovered_on FROM torrents WHERE info_hash='%s' LIMIT 1;" % (info_hash,))
         try:
-            torrent_id, name, discovered_on = cur.fetchone()
+            name, discovered_on = cur.fetchone()
         except TypeError:  # In case no results returned, TypeError will be raised when we try to subscript None object
             return flask.abort(404)
 
-        cur = magneticod_db.execute("SELECT path, size FROM files WHERE torrent_id=?;", (torrent_id,))
+        cur.execute("SELECT path, size FROM files "
+                                    "WHERE torrent_id=(SELECT id FROM torrents WHERE info_hash='%s' LIMIT 1);" % \
+                                    (info_hash,))
         raw_files = cur.fetchall()
-        size = sum(f[1] for f in raw_files)
-        files = [File(f[0], utils.to_human_size(f[1])) for f in raw_files]
+        size = sum(int(f[1]) for f in raw_files)
+        files = [File(f[0], utils.to_human_size(int(f[1]))) for f in raw_files]
 
-    context["torrent"] = Torrent(info_hash.hex(), name, utils.to_human_size(size), datetime.fromtimestamp(discovered_on).strftime("%d/%m/%Y"), files)
+    context["torrent"] = Torrent(info_hash, name, utils.to_human_size(size), datetime.fromtimestamp(discovered_on).strftime("%d/%m/%Y"), files)
 
     return flask.render_template("torrent.html", **context)
 
 
-def initialize_magneticod_db() -> None:
-    global magneticod_db
+def get_magneticod_db():
+    """ Opens a new database connection if there is none yet for the current application context. """
+    if hasattr(flask.g, "magneticod_db"):
+        return flask.g.magneticod_db
+    magneticod_db = flask.g.magneticod_db = pymysql.connect(host="localhost",user="user",passwd="passwd",db="btdata",charset='utf8');
+   # magneticod_db_path = os.path.join(appdirs.user_data_dir("magneticod"), "database.sqlite3")
+   # magneticod_db = flask.g.magneticod_db = sqlite3.connect(magneticod_db_path, isolation_level=None)
 
-    logging.info("Connecting to magneticod's database...")
+   # with magneticod_db:
+   #     magneticod_db.execute("CREATE VIRTUAL TABLE temp.fts_torrents USING fts4(torrent_id INTEGER, name TEXT NOT NULL,tokenize=unicode61);")
+   #     magneticod_db.execute("INSERT INTO fts_torrents (torrent_id, name) SELECT id, name FROM torrents;")
+   #     magneticod_db.execute("INSERT INTO fts_torrents (fts_torrents) VALUES ('optimize');")
 
-    magneticod_db_path = os.path.join(appdirs.user_data_dir("magneticod"), "database.sqlite3")
-    magneticod_db = sqlite3.connect(magneticod_db_path, isolation_level=None)
+   #     magneticod_db.execute("CREATE TEMPORARY TRIGGER on_torrents_insert AFTER INSERT ON torrents FOR EACH ROW BEGIN"
+   #                           "    INSERT INTO fts_torrents (torrent_id, name) VALUES (NEW.id, NEW.name);"
+   #                           "END;")
 
-    with magneticod_db:
-        magneticod_db.execute("PRAGMA journal_mode=WAL;")
-        magneticod_db.execute("PRAGMA temp_store=2;")
+   # magneticod_db.create_function("rank", 1, utils.rank)
 
-        magneticod_db.execute("CREATE VIRTUAL TABLE temp.fts_torrents USING fts4(name ,tokenize=unicode61;)")
-        magneticod_db.execute("INSERT INTO fts_torrents (docid, name) SELECT id, name FROM torrents;")
-        magneticod_db.execute("INSERT INTO fts_torrents (fts_torrents) VALUES ('optimize');")
-
-        magneticod_db.execute("CREATE TEMPORARY TRIGGER on_torrents_insert AFTER INSERT ON torrents FOR EACH ROW BEGIN"
-                              "    INSERT INTO fts_torrents (docid, name) VALUES (NEW.id, NEW.name);"
-                              "END;")
-
-    magneticod_db.create_function("rank", 1, utils.rank)
+    return magneticod_db
 
 
-def close_db() -> None:
-    logging.info("Closing magneticod database...")
-    if magneticod_db is not None:
-        magneticod_db.close()
+@app.teardown_appcontext
+def close_magneticod_db(error):
+    """ Closes the database again at the end of the request. """
+    if hasattr(flask.g, "magneticod_db"):
+        flask.g.magneticod_db.close()

@@ -17,17 +17,17 @@ import sqlite3
 import time
 import typing
 import os
-
+import pymysql
 from . import bencode
 
 
 # threshold for pending info hashes before being committed to database:
-PENDING_INFO_HASHES = 10
+PENDING_INFO_HASHES = 50
 
 
 class Database:
-    def __init__(self, database) -> None:
-        self.__db_conn = self.__connect(database)
+    def __init__(self) -> None:
+        self.__db_conn = self.__connect()
 
         # We buffer metadata to flush many entries at once, for performance reasons.
         # list of tuple (info_hash, name, total_size, discovered_on)
@@ -36,33 +36,35 @@ class Database:
         self.__pending_files = []  # type: typing.List[typing.Tuple[bytes, int, bytes]]
 
     @staticmethod
-    def __connect(database) -> sqlite3.Connection:
-        os.makedirs(os.path.split(database)[0], exist_ok=True)
-        db_conn = sqlite3.connect(database, isolation_level=None)
+    def __connect() -> pymysql.Connection:
+        mysql_db=pymysql.connect(host="localhost",user="user",passwd="passwd",db="btdata",charset='utf8')
+        return mysql_db
+        #os.makedirs(os.path.split(database)[0], exist_ok=True)
+        #db_conn = sqlite3.connect(database, isolation_level=None)
 
-        db_conn.execute("PRAGMA journal_mode=WAL;")
-        db_conn.execute("PRAGMA temp_store = 2;")
-        db_conn.execute("PRAGMA foreign_keys=ON;")
+        #db_conn.execute("PRAGMA journal_mode=WAL;")
+        #db_conn.execute("PRAGMA foreign_keys=ON;")
 
-        with db_conn:
-            db_conn.execute("CREATE TABLE IF NOT EXISTS torrents ("
-                            "id             INTEGER PRIMARY KEY AUTOINCREMENT,"
-                            "info_hash      BLOB NOT NULL UNIQUE,"
-                            "name           TEXT NOT NULL,"
-                            "total_size     INTEGER NOT NULL CHECK(total_size > 0),"
-                            "discovered_on  INTEGER NOT NULL CHECK(discovered_on > 0)"
-                            ");")
-            db_conn.execute("CREATE INDEX IF NOT EXISTS info_hash_index ON torrents (info_hash);")
-            db_conn.execute("CREATE TABLE IF NOT EXISTS files ("
-                            "id          INTEGER PRIMARY KEY,"
-                            "torrent_id  INTEGER REFERENCES torrents ON DELETE CASCADE ON UPDATE RESTRICT,"
-                            "size        INTEGER NOT NULL,"
-                            "path        TEXT NOT NULL"
-                            ");")
+        #with db_conn:
+        #    db_conn.execute("CREATE TABLE IF NOT EXISTS torrents ("
+        #                    "id             INTEGER PRIMARY KEY,"
+        #                    "info_hash      BLOB NOT NULL UNIQUE,"
+        #                    "name           TEXT NOT NULL,"
+        #                    "total_size     INTEGER NOT NULL CHECK(total_size > 0),"
+        #                    "discovered_on  INTEGER NOT NULL CHECK(discovered_on > 0)"
+        #                    ");")
+        #    db_conn.execute("CREATE TABLE IF NOT EXISTS files ("
+        #                    "id          INTEGER PRIMARY KEY,"
+        #                    "torrent_id  INTEGER REFERENCES torrents ON DELETE CASCADE ON UPDATE RESTRICT,"
+        #                    "size        INTEGER NOT NULL,"
+        #                    "path        TEXT NOT NULL"
+        #                    ");")
 
-        return db_conn
+        #return db_conn
 
     def add_metadata(self, info_hash: bytes, metadata: bytes) -> bool:
+        if self.check_hash(info_hash.hex()) :
+            return False
         files = []
         discovered_on = int(time.time())
         try:
@@ -77,15 +79,18 @@ class Database:
                     # Refuse trailing slash in any of the path items
                     assert not any(b"/" in item for item in file[b"path"])
                     path = "/".join(i.decode("utf-8") for i in file[b"path"])
-                    files.append((info_hash, file[b"length"], path))
+                    #files.append(multipleRows([info_hash, file[b"length"], path]))
+                    files.append((info_hash.hex(), file[b"length"], path))
             else:  # Single File torrent:
                 assert type(info[b"length"]) is int
-                files.append((info_hash, info[b"length"], name))
+                #files.append(multipleRows([info_hash, info[b"length"], name]))
+                files.append((info_hash.hex(), info[b"length"], name))
         # TODO: Make sure this catches ALL, AND ONLY operational errors
         except (bencode.BencodeDecodingError, AssertionError, KeyError, AttributeError, UnicodeDecodeError):
             return False
-
-        self.__pending_metadata.append((info_hash, name, sum(f[1] for f in files), discovered_on))
+        self.__pending_metadata.append(self.multipleRows([info_hash.hex(), name, sum(f[1] for f in files),discovered_on]))
+        #for part in files:
+        #    self.__pending_files.append(multipleRows(part))
         self.__pending_files += files
 
         logging.info("Added: `%s`", name)
@@ -95,6 +100,16 @@ class Database:
             self.__commit_metadata()
 
         return True
+    def multipleRows(self,params):
+        ret = []
+        for param in params:
+            if isinstance(param, (int, float, bool)):
+                ret.append(str(param))
+            elif isinstance(param, (str,)):
+                ret.append('"' + param + '"')
+            else:
+                logging.exception('unsupport value: `%s` ' ,param)
+        return '(' + ','.join(ret) + ')'
 
     def get_complete_info_hashes(self) -> typing.Set[bytes]:
         cur = self.__db_conn.cursor()
@@ -103,23 +118,34 @@ class Database:
             return set(x[0] for x in cur.fetchall())
         finally:
             cur.close()
+    def check_hash(self,hashinfo) -> bool:
+        cur = self.__db_conn.cursor()
+        result = None
+        try:
+            cur.execute("SELECT id FROM torrents WHERE info_hash = %s;",(hashinfo,))
+            result = cur.fetchone()
+        finally:
+            cur.close()
+        if result is None:
+            return False
+        else :
+            return True
 
     def __commit_metadata(self) -> None:
         cur = self.__db_conn.cursor()
         cur.execute("BEGIN;")
         # noinspection PyBroadException
         try:
-            cur.executemany(
-                "INSERT INTO torrents (info_hash, name, total_size, discovered_on) VALUES (?, ?, ?, ?);",
-                self.__pending_metadata
+            cur.execute(
+                "INSERT INTO torrents (info_hash, name, total_size, discovered_on) VALUES %s " % ','.join(self.__pending_metadata)
             )
             cur.executemany(
                 "INSERT INTO files (torrent_id, size, path) "
-                "VALUES ((SELECT id FROM torrents WHERE info_hash=?), ?, ?);",
+                "VALUES ((SELECT id FROM torrents WHERE info_hash=%s), %s, %s);",
                 self.__pending_files
             )
             cur.execute("COMMIT;")
-            logging.info("%d metadata (%d files) are committed to the database.",
+            logging.debug("%d metadata (%d files) are committed to the database.",
                           len(self.__pending_metadata), len(self.__pending_files))
             self.__pending_metadata.clear()
             self.__pending_files.clear()
@@ -127,6 +153,8 @@ class Database:
             cur.execute("ROLLBACK;")
             logging.exception("Could NOT commit metadata to the database! (%d metadata are pending)",
                               len(self.__pending_metadata))
+            self.__pending_metadata.clear()
+            self.__pending_files.clear()
         finally:
             cur.close()
 
