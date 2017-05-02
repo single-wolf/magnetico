@@ -91,10 +91,10 @@ def search_torrents():
         "search": search,
         "page": page
     }
-    searchkey = '%'+search+'%'
+    #searchkey = '%'+search+'%'
     total_page = 20*page
     with magneticod_db.cursor() as cur:
-        sql="SELECT info_hash,name,total_size,discovered_on FROM torrents where name like '%s' ORDER BY id DESC LIMIT 20 OFFSET %d;" % (searchkey,total_page)
+        sql="SELECT info_hash,name,total_size,discovered_on FROM torrents where MATCH(name) AGAINST ( '%s' IN BOOLEAN MODE) ORDER BY id DESC LIMIT 20 OFFSET %d;" % (search,total_page)
         #cur.execute(
         #    "SELECT"
         #    "    info_hash, "
