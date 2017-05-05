@@ -31,7 +31,7 @@ def main() -> int:
 
     http_server = gevent.wsgi.WSGIServer(("", arguments.port), magneticow.app)
 
-    magneticow.initialize_magneticod_db()
+    magneticow.get_magneticod_db()
 
     try:
         logging.info("magneticow is ready to serve!")
